@@ -41,3 +41,4 @@
 *.dwo
 data/
 .ipynb_checkpoints/
+cufile.log
