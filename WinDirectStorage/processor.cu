@@ -30,6 +30,7 @@ using Microsoft::WRL::ComPtr;
 #define LOCAL_HASH_SIZE 64
 #define BLOCK_SIZE 256
 
+// ASHAH: 32MB is a pretty small chunk, we should probably up this
 const uint64_t DS_CHUNK_SIZE = 32 * 1024 * 1024; // 32MB chunks for DirectStorage
 
 struct StationStats {
@@ -46,6 +47,7 @@ struct StationStats {
 // 2. DEVICE HELPER FUNCTIONS (From your working code)
 // =================================================================================
 
+// ASHAH: we should find faster hash
 __device__ __host__ unsigned int hash_string(const char* str, size_t len) {
     unsigned int hash = 5381;
     for (size_t i = 0; i < len; i++) {
@@ -54,6 +56,7 @@ __device__ __host__ unsigned int hash_string(const char* str, size_t len) {
     return hash;
 }
 
+// ASHAH: this is almost definitely optimizable as well
 __device__ void parse_line_int(const char* line, size_t line_len,
     char* station, size_t* station_len, int* temp_int) {
     size_t i = 0;
@@ -87,6 +90,7 @@ __device__ void parse_line_int(const char* line, size_t line_len,
     *temp_int = temp_val * sign;
 }
 
+// ASHAH: just compare hashes?
 __device__ bool strings_equal(const char* s1, const char* s2, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (s1[i] != s2[i]) return false;
@@ -104,6 +108,7 @@ __global__ void process_measurements_local(const char* data, const size_t* line_
     size_t thread_id = global_idx;
 
     StationStats local_hash[LOCAL_HASH_SIZE];
+    // ASHAH: just default to 0 and skip the loop
     for (int i = 0; i < LOCAL_HASH_SIZE; i++) {
         local_hash[i].count = 0;
     }
@@ -130,6 +135,7 @@ __global__ void process_measurements_local(const char* data, const size_t* line_
         unsigned int hash = hash_string(station, station_len);
         int slot = hash % LOCAL_HASH_SIZE;
 
+        // ASHAH: why are we using a bool check instead of just breaking?
         bool inserted = false;
         for (int probe = 0; probe < LOCAL_HASH_SIZE && !inserted; probe++) {
             int current_slot = (slot + probe) % LOCAL_HASH_SIZE;
@@ -159,6 +165,8 @@ __global__ void process_measurements_local(const char* data, const size_t* line_
         }
     }
 
+    // ASHAH: I'm wondering if its even worth doing local hash if we rarely have collisions / same stations repeatedly
+    // may be better to just write directly to thread_results
     int write_idx = 0;
     for (int i = 0; i < LOCAL_HASH_SIZE; i++) {
         if (local_hash[i].count > 0) {
@@ -184,7 +192,9 @@ __global__ void merge_results(StationStats* thread_results, int* thread_counts, 
         bool inserted = false;
         for (int probe = 0; probe < HASH_SIZE && !inserted; probe++) {
             int current_slot = (slot + probe) % HASH_SIZE;
-
+            // ASHAH: why do we have two separate methods for this?
+            // we CAS & lock and if that doesn't work we busy-wait and then atomicAdd
+            // why not just do one or the other?
             int old_count = atomicCAS((int*)&global_hash[current_slot].count, 0, -1);
 
             if (old_count == 0) {
@@ -229,7 +239,7 @@ __global__ void merge_results(StationStats* thread_results, int* thread_counts, 
 // =================================================================================
 // 4. GPU LINE OFFSET FINDER KERNELS
 // =================================================================================
-
+// ASHAH: i don't think we need this as a whole
 // Single-pass kernel: Each thread writes its newlines directly with atomic positioning
 __global__ void build_offsets_kernel_atomic(const char* data, size_t data_size,
     size_t* offsets, size_t* counter) {
@@ -363,6 +373,7 @@ int main(int argc, char* argv[]) {
 
     QueryPerformanceCounter(&start_total);
 
+    // ASHAH: somewhere here we need to add multiple buffers - not sure how to do this though
     // D3D12 & DS Objects
     ComPtr<ID3D12Device> pDevice;
     ComPtr<IDXGIFactory4> pDxgiFactory;
@@ -493,6 +504,9 @@ int main(int argc, char* argv[]) {
         uint64_t numChunks = (fileSize + DS_CHUNK_SIZE - 1) / DS_CHUNK_SIZE;
         printf("     Enqueuing %llu read requests...\n", numChunks);
 
+        // ASHAH: Here we're creating requests for each chunk and then queueing requests, fencing, then submitting
+        // this is why we're having all the data transfer happen prior to any computation
+        // make multiple buffers and handle that here
         for (uint64_t i = 0; i < numChunks; ++i) {
             DSTORAGE_REQUEST request = {};
             request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
@@ -549,17 +563,22 @@ int main(int argc, char* argv[]) {
         printf("[Prep] Finding line offsets on GPU...\n");
         QueryPerformanceCounter(&start_offsets);
 
+        // ASHAH: we probably want to dynamically select this based on machine resources
         // Calculate grid size for scanning
         int scan_blocks = 2048;  // Good parallelism
         int scan_threads = 256;
 
+        // ASHAH: this is dumb asf
         // Estimate max lines (conservative: avg 10 bytes per line)
         size_t max_lines = fileSize / 10 + 1;
 
+        // ASHAH: do line offsets thread-local and it's infinitely better
         // Allocate offsets array and counter
         ThrowIfCudaFailed(cudaMalloc(&d_lineOffsets, (max_lines + 1) * sizeof(size_t)),
             "Malloc line offsets");
 
+        // ASHAH: why do we have this? I'm betting we're getting a significantly slower processing because we're doing global mem accesses w/
+        // contention on this
         size_t* d_counter;
         ThrowIfCudaFailed(cudaMalloc(&d_counter, sizeof(size_t)), "Malloc counter");
         ThrowIfCudaFailed(cudaMemset(d_counter, 0, sizeof(size_t)), "Reset counter");
@@ -595,6 +614,8 @@ int main(int argc, char* argv[]) {
         // --- 7. Allocate CUDA Working Memory ---
         printf("[CUDA] Allocating working memory...\n");
 
+        // ASHAH: again, select size dynamically instead of just hard-coding
+        // also because regardless of input size we're going to have the same amount of memory allocated for hashtables
         int num_blocks = 256;
         int num_threads = num_blocks * BLOCK_SIZE;
 
@@ -606,6 +627,7 @@ int main(int argc, char* argv[]) {
         ThrowIfCudaFailed(cudaMalloc(&d_threadResults,
             (size_t)num_threads * LOCAL_HASH_SIZE * sizeof(StationStats)),
             "Malloc thread results");
+        // ASHAH: what is threadCounts?
         ThrowIfCudaFailed(cudaMalloc(&d_threadCounts, num_threads * sizeof(int)),
             "Malloc thread counts");
 
@@ -649,6 +671,7 @@ int main(int argc, char* argv[]) {
         // --- 10. Sort and Write Output ---
         printf("[Out] Writing output...\n");
 
+        // ASHAH: man why isn't this an unordered map
         std::map<std::string, StationStats> sortedStats;
         for (int i = 0; i < HASH_SIZE; i++) {
             if (h_globalHash[i].count > 0 && h_globalHash[i].name[0] != '\0') {
