@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,8 @@
 #include <map>
 #include <string>
 #include <iomanip>
+#include <vector>
+#include <algorithm>
 
 // Windows & D3D12
 #include <d3d12.h>
@@ -26,22 +29,47 @@ using Microsoft::WRL::ComPtr;
 // =================================================================================
 
 #define MAX_NAME_LEN 100
-#define HASH_SIZE 16384
-#define LOCAL_HASH_SIZE 24  // Reduced from 64
-#define BLOCK_SIZE 256
+#define GLOBAL_HASH_SIZE 65536 
+#define SHM_HASH_SIZE 1024 
 
+// FNV-1a 64-bit Constants
+#define FNV_PRIME_64 1099511628211ULL
+#define FNV_OFFSET_BASIS_64 14695981039346656037ULL
+
+// IO Configuration
 const int NUM_STREAM_BUFFERS = 3;
 const uint64_t STREAM_CHUNK_SIZE = 31 * 1024 * 1024; // 256MB chunks
-const size_t OVERLAP_SIZE = 4096; // 4KB overlap for boundary detection
+const size_t OVERLAP_SIZE = 65536; // 64KB overlap
+const int THREADS_PER_BLOCK = 256;
 
+// CPU-Side Helper
 struct StationStats {
-    char name[MAX_NAME_LEN];
     int min;
     int max;
-    int64_t sum;
+    long long sum;
     int count;
-    unsigned int hash;
-    size_t name_len;
+};
+
+// GPU-Side Stats (16 bytes aligned)
+struct __align__(16) CompactStats {
+    long long sum;
+    int min;
+    int max;
+    int count;
+};
+
+// Global Map Entry
+struct GlobalMapEntry {
+    char name[MAX_NAME_LEN];
+    CompactStats stats;
+    unsigned long long hash; // 64-bit Hash
+};
+
+// Shared Memory Entry
+struct ShmEntry {
+    unsigned long long hash;
+    int name_offset;
+    CompactStats stats;
 };
 
 struct StreamBuffer {
@@ -55,278 +83,9 @@ struct StreamBuffer {
     cudaStream_t cudaStream;
     cudaEvent_t processingComplete;
 
-    // Per-chunk working memory
-    size_t* d_lineOffsets;
-    size_t* d_counter;
-    size_t* d_lastNewline;
-    StationStats* d_threadResults;
-    int* d_threadCounts;
-
-    size_t maxLinesCapacity;
-    uint64_t actualDataSize;
     bool inUse;
+    uint64_t allocationSize; // Store the real allocation size
 };
-
-// =================================================================================
-// DEVICE HELPER FUNCTIONS
-// =================================================================================
-
-__device__ __host__ unsigned int hash_string(const char* str, size_t len) {
-    unsigned int hash = 5381;
-    for (size_t i = 0; i < len; i++) {
-        hash = ((hash << 5) + hash) + str[i];
-    }
-    return hash;
-}
-
-__device__ void parse_line_int(const char* line, size_t line_len,
-    char* station, size_t* station_len, int* temp_int) {
-    size_t i = 0;
-    while (i < line_len && line[i] != ';') {
-        station[i] = line[i];
-        i++;
-    }
-    *station_len = i;
-    station[i] = '\0';
-
-    i++;
-    if (i >= line_len) return;
-
-    int sign = 1;
-    int temp_val = 0;
-
-    if (line[i] == '-') {
-        sign = -1;
-        i++;
-    }
-
-    if (i + 1 < line_len && line[i + 1] == '.') {
-        temp_val = (line[i] - '0') * 10 + (line[i + 2] - '0');
-    }
-    else if (i + 2 < line_len && line[i + 2] == '.') {
-        temp_val = (line[i] - '0') * 100 + (line[i + 1] - '0') * 10 + (line[i + 3] - '0');
-    }
-
-    *temp_int = temp_val * sign;
-}
-
-__device__ bool strings_equal(const char* s1, const char* s2, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        if (s1[i] != s2[i]) return false;
-    }
-    return true;
-}
-
-// =================================================================================
-// CUDA KERNELS
-// =================================================================================
-
-__global__ void build_offsets_kernel_atomic(const char* data, size_t data_size,
-    size_t* offsets, size_t* counter) {
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = (size_t)blockDim.x * gridDim.x;
-
-    for (size_t i = idx; i < data_size; i += stride) {
-        if (data[i] == '\n' && i + 1 < data_size) {
-            size_t pos = atomicAdd((unsigned long long*)counter, 1ULL);
-            offsets[pos + 1] = i + 1;
-        }
-    }
-}
-
-__global__ void find_last_newline(const char* data, size_t size, size_t* result) {
-    // Search backwards from end for last newline
-    size_t searchStart = (size > OVERLAP_SIZE) ? (size - OVERLAP_SIZE) : 0;
-
-    for (size_t i = size - 1; i > searchStart; i--) {
-        if (data[i] == '\n') {
-            *result = i + 1;
-            return;
-        }
-    }
-    // If no newline found in overlap region, use full size
-    *result = size;
-}
-
-// Add d_globalHash to parameters to handle overflow
-__global__ void process_measurements_local(const char* data, const size_t* line_offsets, size_t num_lines,
-    StationStats* thread_results, int* thread_counts, StationStats* global_hash, size_t data_limit) {
-
-    size_t global_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t thread_id = global_idx;
-
-    StationStats local_hash[LOCAL_HASH_SIZE];
-    for (int i = 0; i < LOCAL_HASH_SIZE; i++) {
-        local_hash[i].count = 0;
-    }
-
-    for (size_t idx = global_idx; idx < num_lines; idx += (size_t)blockDim.x * gridDim.x) {
-        size_t start = line_offsets[idx];
-
-        // FIX 1: Scan for newline manually to determine length. 
-        // Do not rely on line_offsets[idx+1] which is unsorted.
-        size_t line_len = 0;
-        size_t scan_pos = start;
-        while (scan_pos < data_limit && data[scan_pos] != '\n') {
-            scan_pos++;
-        }
-        line_len = scan_pos - start;
-
-        // Handle CR/LF
-        if (line_len > 0 && data[start + line_len - 1] == '\r') line_len--;
-        if (line_len <= 1) continue;
-
-        char station[MAX_NAME_LEN];
-        size_t station_len;
-        int temp_int;
-
-        parse_line_int(data + start, line_len, station, &station_len, &temp_int);
-
-        if (station_len == 0) continue;
-
-        unsigned int hash = hash_string(station, station_len);
-
-        // Try Local Insert
-        bool inserted = false;
-        int slot = hash % LOCAL_HASH_SIZE;
-
-        for (int probe = 0; probe < LOCAL_HASH_SIZE && !inserted; probe++) {
-            int current_slot = (slot + probe) % LOCAL_HASH_SIZE;
-
-            if (local_hash[current_slot].count == 0) {
-                // Found empty slot - Init
-                for (size_t i = 0; i < station_len; i++) local_hash[current_slot].name[i] = station[i];
-                local_hash[current_slot].name[station_len] = '\0';
-                local_hash[current_slot].min = temp_int;
-                local_hash[current_slot].max = temp_int;
-                local_hash[current_slot].sum = (int64_t)temp_int;
-                local_hash[current_slot].count = 1;
-                local_hash[current_slot].hash = hash;
-                local_hash[current_slot].name_len = station_len;
-                inserted = true;
-            }
-            else if (local_hash[current_slot].hash == hash &&
-                local_hash[current_slot].name_len == station_len &&
-                strings_equal(local_hash[current_slot].name, station, station_len)) {
-                // Found existing slot - Update
-                if (temp_int < local_hash[current_slot].min) local_hash[current_slot].min = temp_int;
-                if (temp_int > local_hash[current_slot].max) local_hash[current_slot].max = temp_int;
-                local_hash[current_slot].sum += (int64_t)temp_int;
-                local_hash[current_slot].count++;
-                inserted = true;
-            }
-        }
-
-        // FIX 2: FALLBACK TO GLOBAL MEMORY
-        // If the local table was full, we MUST write to global immediately to avoid data loss.
-        if (!inserted) {
-            int g_slot = hash % HASH_SIZE;
-            bool g_inserted = false;
-
-            // Simple infinite loop until inserted (global atomic logic)
-            for (int probe = 0; probe < HASH_SIZE && !g_inserted; probe++) {
-                int current_g_slot = (g_slot + probe) % HASH_SIZE;
-
-                // Identical logic to merge_results, applied here for overflow items
-                int old_count = atomicCAS((int*)&global_hash[current_g_slot].count, 0, -1);
-
-                if (old_count == 0) {
-                    // We grabbed the lock on a new slot
-                    for (size_t j = 0; j < station_len; j++) global_hash[current_g_slot].name[j] = station[j];
-                    global_hash[current_g_slot].name[station_len] = '\0';
-                    global_hash[current_g_slot].min = temp_int;
-                    global_hash[current_g_slot].max = temp_int;
-                    global_hash[current_g_slot].sum = temp_int;
-                    global_hash[current_g_slot].hash = hash;
-                    __threadfence();
-                    global_hash[current_g_slot].count = 1;
-                    g_inserted = true;
-                }
-                else if (old_count != -1) {
-                    // Slot occupied, wait if locked
-                    while (atomicAdd((int*)&global_hash[current_g_slot].count, 0) == -1);
-
-                    if (global_hash[current_g_slot].hash == hash) {
-                        // Check string match... roughly (for speed we might trust hash + probe, 
-                        // but ideally we check string here too. Assuming hash collision rare for fallback).
-                        atomicMin(&global_hash[current_g_slot].min, temp_int);
-                        atomicMax(&global_hash[current_g_slot].max, temp_int);
-                        atomicAdd((unsigned long long*) & global_hash[current_g_slot].sum, (unsigned long long)(int64_t)temp_int);
-                        atomicAdd(&global_hash[current_g_slot].count, 1);
-                        g_inserted = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Flush local results to output buffer... (rest of your code remains same)
-    int write_idx = 0;
-    for (int i = 0; i < LOCAL_HASH_SIZE; i++) {
-        if (local_hash[i].count > 0) {
-            thread_results[thread_id * LOCAL_HASH_SIZE + write_idx] = local_hash[i];
-            write_idx++;
-        }
-    }
-    thread_counts[thread_id] = write_idx;
-}
-
-__global__ void merge_results(StationStats* thread_results, int* thread_counts, int num_threads,
-    StationStats* global_hash) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= num_threads) return;
-
-    int count = thread_counts[idx];
-    for (int i = 0; i < count; i++) {
-        StationStats* stat = &thread_results[idx * LOCAL_HASH_SIZE + i];
-        unsigned int hash = stat->hash;
-        int slot = hash % HASH_SIZE;
-
-        bool inserted = false;
-        for (int probe = 0; probe < HASH_SIZE && !inserted; probe++) {
-            int current_slot = (slot + probe) % HASH_SIZE;
-
-            int old_count = atomicCAS((int*)&global_hash[current_slot].count, 0, -1);
-
-            if (old_count == 0) {
-                size_t name_len = 0;
-                while (stat->name[name_len] != '\0') name_len++;
-                for (size_t j = 0; j < name_len; j++) {
-                    global_hash[current_slot].name[j] = stat->name[j];
-                }
-                global_hash[current_slot].name[name_len] = '\0';
-
-                global_hash[current_slot].min = stat->min;
-                global_hash[current_slot].max = stat->max;
-                global_hash[current_slot].sum = stat->sum;
-                global_hash[current_slot].hash = stat->hash;
-
-                __threadfence();
-
-                global_hash[current_slot].count = stat->count;
-                inserted = true;
-            }
-            else if (old_count != -1) {
-                while (atomicAdd((int*)&global_hash[current_slot].count, 0) == -1);
-
-                if (global_hash[current_slot].hash == hash) {
-                    size_t name_len = 0;
-                    while (stat->name[name_len] != '\0') name_len++;
-
-                    if (strings_equal(global_hash[current_slot].name, stat->name, name_len)) {
-                        atomicMin(&global_hash[current_slot].min, stat->min);
-                        atomicMax(&global_hash[current_slot].max, stat->max);
-                        atomicAdd((unsigned long long*) & global_hash[current_slot].sum,
-                            (unsigned long long)stat->sum);
-                        atomicAdd(&global_hash[current_slot].count, stat->count);
-                        inserted = true;
-                    }
-                }
-            }
-        }
-    }
-}
 
 // =================================================================================
 // HELPER FUNCTIONS
@@ -348,6 +107,131 @@ void ThrowIfCudaFailed(cudaError_t err, const char* msg) {
 }
 
 // =================================================================================
+// CUDA KERNELS
+// =================================================================================
+
+__device__ inline void atomic_update_stats(CompactStats* target, int val) {
+    atomicAdd((unsigned long long*) & target->sum, (unsigned long long)(long long)val);
+    atomicMin(&target->min, val);
+    atomicMax(&target->max, val);
+    atomicAdd(&target->count, 1);
+}
+
+__global__ void parse_and_aggregate_kernel(
+    const char* __restrict__ data,
+    size_t chunk_size,
+    size_t buffer_limit,
+    uint64_t chunk_offset_global,
+    GlobalMapEntry* global_map)
+{
+    __shared__ ShmEntry shm_entries[SHM_HASH_SIZE];
+
+    size_t tid = threadIdx.x;
+    for (int i = tid; i < SHM_HASH_SIZE; i += blockDim.x) {
+        shm_entries[i].hash = 0;
+        shm_entries[i].stats.min = 2147483647;
+        shm_entries[i].stats.max = -2147483648;
+        shm_entries[i].stats.sum = 0;
+        shm_entries[i].stats.count = 0;
+    }
+    __syncthreads();
+
+    size_t idx = (size_t)blockIdx.x * blockDim.x + tid;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    const size_t WINDOW_SIZE = 128;
+
+    for (size_t offset = idx * WINDOW_SIZE; offset < buffer_limit; offset += stride * WINDOW_SIZE) {
+        const char* ptr = data + offset;
+        const char* end_window = data + min(offset + WINDOW_SIZE, buffer_limit);
+
+        if (offset == 0) {
+            if (chunk_offset_global > 0) {
+                while (ptr < end_window && *ptr != '\n') ptr++;
+                ptr++;
+            }
+        }
+        else {
+            while (ptr < end_window && *ptr != '\n') ptr++;
+            ptr++;
+        }
+
+        while (ptr < end_window) {
+            if ((size_t)(ptr - data) >= chunk_size) break;
+            if (ptr >= data + buffer_limit) break;
+
+            const char* line_start = ptr;
+            unsigned long long hash = FNV_OFFSET_BASIS_64;
+
+            while (*ptr != ';') {
+                hash = (hash ^ (unsigned char)*ptr) * FNV_PRIME_64;
+                ptr++;
+            }
+            ptr++;
+
+            int sign = 1;
+            if (*ptr == '-') { sign = -1; ptr++; }
+
+            int temp_val = 0;
+            if (*(ptr + 1) == '.') {
+                temp_val = (*ptr - '0') * 10 + (*(ptr + 2) - '0');
+                ptr += 4;
+            }
+            else {
+                temp_val = (*ptr - '0') * 100 + (*(ptr + 1) - '0') * 10 + (*(ptr + 3) - '0');
+                ptr += 5;
+            }
+            temp_val *= sign;
+
+            int slot = hash & (SHM_HASH_SIZE - 1);
+            bool inserted = false;
+            while (!inserted) {
+                unsigned long long old = atomicCAS(&shm_entries[slot].hash, 0ULL, hash);
+                if (old == 0ULL || old == hash) {
+                    if (old == 0ULL) shm_entries[slot].name_offset = (int)(line_start - data);
+                    atomic_update_stats(&shm_entries[slot].stats, temp_val);
+                    inserted = true;
+                }
+                else {
+                    slot = (slot + 1) & (SHM_HASH_SIZE - 1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < SHM_HASH_SIZE; i += blockDim.x) {
+        if (shm_entries[i].hash != 0) {
+            unsigned long long hash = shm_entries[i].hash;
+            int slot = hash % GLOBAL_HASH_SIZE;
+
+            while (true) {
+                unsigned long long old = atomicCAS(&global_map[slot].hash, 0ULL, hash);
+
+                if (old == 0ULL || old == hash) {
+                    if (old == 0ULL) {
+                        const char* src = data + shm_entries[i].name_offset;
+                        int c_idx = 0;
+                        while (src[c_idx] != ';' && c_idx < MAX_NAME_LEN - 1) {
+                            global_map[slot].name[c_idx] = src[c_idx];
+                            c_idx++;
+                        }
+                        global_map[slot].name[c_idx] = '\0';
+                    }
+
+                    atomicAdd((unsigned long long*) & global_map[slot].stats.sum, (unsigned long long)shm_entries[i].stats.sum);
+                    atomicMin(&global_map[slot].stats.min, shm_entries[i].stats.min);
+                    atomicMax(&global_map[slot].stats.max, shm_entries[i].stats.max);
+                    atomicAdd(&global_map[slot].stats.count, shm_entries[i].stats.count);
+
+                    break;
+                }
+                slot = (slot + 1) % GLOBAL_HASH_SIZE;
+            }
+        }
+    }
+}
+
+// =================================================================================
 // MAIN
 // =================================================================================
 
@@ -360,47 +244,31 @@ int main(int argc, char* argv[]) {
     const char* inputFileName = argv[1];
     const char* outputFileName = argv[2];
 
-    LARGE_INTEGER freq;
+    LARGE_INTEGER freq, start_total, end_total;
     QueryPerformanceFrequency(&freq);
-
-    auto get_elapsed_ms = [&freq](LARGE_INTEGER start, LARGE_INTEGER end) -> double {
-        return (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-        };
-
-    LARGE_INTEGER start_total, end_total;
-    LARGE_INTEGER start_stream, end_stream;
-
     QueryPerformanceCounter(&start_total);
 
-    // D3D12 & DS Objects
     ComPtr<ID3D12Device> pDevice;
     ComPtr<IDXGIFactory4> pDxgiFactory;
     ComPtr<IDStorageFactory> pDsFactory;
     ComPtr<IDStorageFile> pDsFile;
     ComPtr<IDStorageQueue> pDsQueue;
 
-    // CUDA Objects
-    StationStats* d_globalHash = nullptr;
+    GlobalMapEntry* d_globalMap = nullptr;
     StreamBuffer streamBuffers[NUM_STREAM_BUFFERS];
 
     try {
-        // === 1. Init D3D12 & CUDA ===
-        printf("[Init] Initializing D3D12 and CUDA...\n");
-
+        // Init
         CreateDXGIFactory2(0, IID_PPV_ARGS(&pDxgiFactory));
-
         ComPtr<IDXGIAdapter1> pAdapter;
         pDxgiFactory->EnumAdapters1(0, &pAdapter);
-
         D3D12CreateDevice(pAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pDevice));
 
-        // Find matching CUDA device
-        int numCudaDevices = 0;
-        cudaGetDeviceCount(&numCudaDevices);
-
+        // CUDA Setup: Find device matching the DXGI Adapter
         DXGI_ADAPTER_DESC1 adapterDesc;
         pAdapter->GetDesc1(&adapterDesc);
-
+        int numCudaDevices = 0;
+        cudaGetDeviceCount(&numCudaDevices);
         int cudaDeviceID = -1;
         for (int i = 0; i < numCudaDevices; ++i) {
             cudaDeviceProp prop;
@@ -410,18 +278,15 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-
         if (cudaDeviceID == -1) {
-            throw std::runtime_error("No matching CUDA device found.");
+            // Fallback for simple systems
+            cudaDeviceID = 0;
+            printf("Warning: Could not match LUID, defaulting to Device 0\n");
         }
+        cudaSetDevice(cudaDeviceID);
 
-        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceID), "cudaSetDevice");
-
-        // === 2. Init DirectStorage & Get File Info ===
-        printf("[IO] Opening file: %s\n", inputFileName);
-
+        // DirectStorage
         DStorageGetFactory(IID_PPV_ARGS(&pDsFactory));
-
         std::wstring wFileName(inputFileName, inputFileName + strlen(inputFileName));
         ThrowIfFailed(pDsFactory->OpenFile(wFileName.c_str(), IID_PPV_ARGS(&pDsFile)), "OpenFile");
 
@@ -429,36 +294,19 @@ int main(int argc, char* argv[]) {
         pDsFile->GetFileInformation(&fileInfo);
         uint64_t fileSize = (static_cast<uint64_t>(fileInfo.nFileSizeHigh) << 32) | fileInfo.nFileSizeLow;
 
-        printf("     Size: %llu bytes (%.2f GB)\n", fileSize, fileSize / (1024.0 * 1024.0 * 1024.0));
-
-        // === 3. Create DirectStorage Queue ===
         DSTORAGE_QUEUE_DESC dsQueueDesc = {};
         dsQueueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
         dsQueueDesc.Priority = DSTORAGE_PRIORITY_HIGH;
         dsQueueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         dsQueueDesc.Device = pDevice.Get();
-
         pDsFactory->CreateQueue(&dsQueueDesc, IID_PPV_ARGS(&pDsQueue));
-
-        // Set staging buffer size
         pDsFactory->SetStagingBufferSize(512 * 1024 * 1024);
 
-        // === 4. Initialize Stream Buffers ===
-        printf("[Init] Creating %d stream buffers...\n", NUM_STREAM_BUFFERS);
-
-        int num_blocks = 256;
-        int num_threads = num_blocks * BLOCK_SIZE;
-        size_t max_lines_per_chunk = (STREAM_CHUNK_SIZE / 10) + 1000;
-
+        // === Buffer Init (FIXED) ===
         for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
             auto& buf = streamBuffers[i];
 
-            // Create D3D12 buffer
-            D3D12_HEAP_PROPERTIES heapProps = {
-                D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                D3D12_MEMORY_POOL_UNKNOWN, 1, 1
-            };
-
+            // 1. Define Resource Description
             D3D12_RESOURCE_DESC resDesc = {};
             resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             resDesc.Width = STREAM_CHUNK_SIZE + OVERLAP_SIZE;
@@ -469,117 +317,62 @@ int main(int argc, char* argv[]) {
             resDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             resDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-            ThrowIfFailed(pDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_SHARED,
-                &resDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                IID_PPV_ARGS(&buf.d3d12Buffer)), "Create stream buffer");
+            // 2. Get REAL allocation size (Fix for Invalid Argument)
+            D3D12_RESOURCE_ALLOCATION_INFO allocInfo = pDevice->GetResourceAllocationInfo(0, 1, &resDesc);
+            buf.allocationSize = allocInfo.SizeInBytes; // This is the size CUDA wants
 
-            // Create fence
+            D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1 };
+
+            ThrowIfFailed(pDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_SHARED, &resDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buf.d3d12Buffer)), "Create buffer");
+
             pDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&buf.d3dFence));
             buf.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
             buf.fenceValue = 0;
 
-            // Import to CUDA
-            HANDLE sharedHandle;
-            pDevice->CreateSharedHandle(buf.d3d12Buffer.Get(), nullptr,
-                GENERIC_ALL, nullptr, &sharedHandle);
+            // 3. Create Shared Handle with Error Check
+            HANDLE sharedHandle = nullptr;
+            ThrowIfFailed(pDevice->CreateSharedHandle(buf.d3d12Buffer.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle), "CreateSharedHandle");
 
+            // 4. Import using the PHYSICAL allocation size
             cudaExternalMemoryHandleDesc extDesc = {};
             extDesc.type = cudaExternalMemoryHandleTypeD3D12Resource;
-            extDesc.flags = cudaExternalMemoryDedicated;
-            extDesc.size = STREAM_CHUNK_SIZE + OVERLAP_SIZE;
+            extDesc.size = buf.allocationSize; // Using the queried size
             extDesc.handle.win32.handle = sharedHandle;
+            extDesc.flags = cudaExternalMemoryDedicated;
 
-            ThrowIfCudaFailed(cudaImportExternalMemory(&buf.cudaExtMem, &extDesc),
-                "Import external memory");
+            ThrowIfCudaFailed(cudaImportExternalMemory(&buf.cudaExtMem, &extDesc), "Import memory");
             CloseHandle(sharedHandle);
 
             cudaExternalMemoryBufferDesc bufDesc = {};
-            bufDesc.size = STREAM_CHUNK_SIZE + OVERLAP_SIZE;
-            ThrowIfCudaFailed(cudaExternalMemoryGetMappedBuffer(&buf.cudaPtr,
-                buf.cudaExtMem, &bufDesc), "Map buffer to CUDA");
+            bufDesc.size = STREAM_CHUNK_SIZE + OVERLAP_SIZE; // We still map the logical size we need
+            bufDesc.offset = 0;
+            ThrowIfCudaFailed(cudaExternalMemoryGetMappedBuffer(&buf.cudaPtr, buf.cudaExtMem, &bufDesc), "Map buffer");
 
-            // Create CUDA stream
-            ThrowIfCudaFailed(cudaStreamCreate(&buf.cudaStream), "Create CUDA stream");
-            ThrowIfCudaFailed(cudaEventCreate(&buf.processingComplete), "Create event");
-
-            // Allocate working memory
-            buf.maxLinesCapacity = max_lines_per_chunk;
-
-            ThrowIfCudaFailed(cudaMalloc(&buf.d_lineOffsets,
-                (buf.maxLinesCapacity + 2) * sizeof(size_t)), "Malloc line offsets");
-            ThrowIfCudaFailed(cudaMalloc(&buf.d_counter, sizeof(size_t)), "Malloc counter");
-            ThrowIfCudaFailed(cudaMalloc(&buf.d_lastNewline, sizeof(size_t)), "Malloc last newline");
-
-            ThrowIfCudaFailed(cudaMalloc(&buf.d_threadResults,
-                (size_t)num_threads * LOCAL_HASH_SIZE * sizeof(StationStats)),
-                "Malloc thread results");
-            ThrowIfCudaFailed(cudaMalloc(&buf.d_threadCounts,
-                num_threads * sizeof(int)), "Malloc thread counts");
-
+            cudaStreamCreate(&buf.cudaStream);
+            cudaEventCreate(&buf.processingComplete);
             buf.inUse = false;
         }
 
-        // === 5. Allocate Global Hash ===
-        ThrowIfCudaFailed(cudaMalloc(&d_globalHash, HASH_SIZE * sizeof(StationStats)),
-            "Malloc global hash");
-        ThrowIfCudaFailed(cudaMemset(d_globalHash, 0, HASH_SIZE * sizeof(StationStats)),
-            "Memset global hash");
+        // Global Map Alloc
+        ThrowIfCudaFailed(cudaMalloc(&d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Malloc map");
+        ThrowIfCudaFailed(cudaMemset(d_globalMap, 0, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Memset map");
 
-        // === 6. Process File in Chunks ===
-        uint64_t numChunks = (fileSize + STREAM_CHUNK_SIZE - 1) / STREAM_CHUNK_SIZE;
-        printf("[Stream] Processing file in %llu chunks of %llu MB...\n",
-            numChunks, STREAM_CHUNK_SIZE / (1024 * 1024));
-
-        QueryPerformanceCounter(&start_stream);
-
+        // === PIPELINED EXECUTION ===
+        uint64_t currentFileOffset = 0;
         int currentBuffer = 0;
         UINT64 nextFenceValue = 1;
-        uint64_t currentFileOffset = 0;
 
         while (currentFileOffset < fileSize) {
-            // === Find Available Buffer ===
-            StreamBuffer* buf = nullptr;
-            int attempts = 0;
+            StreamBuffer* buf = &streamBuffers[currentBuffer];
 
-            while (buf == nullptr) {
-                StreamBuffer& candidate = streamBuffers[currentBuffer];
-
-                if (!candidate.inUse) {
-                    buf = &candidate;
-                }
-                else {
-                    if (candidate.d3dFence->GetCompletedValue() >= candidate.fenceValue) {
-                        cudaError_t err = cudaEventQuery(candidate.processingComplete);
-                        if (err == cudaSuccess) {
-                            candidate.inUse = false;
-                            buf = &candidate;
-                        }
-                        else if (err != cudaErrorNotReady) {
-                            ThrowIfCudaFailed(err, "Event query");
-                        }
-                    }
-                }
-
-                if (buf == nullptr) {
-                    currentBuffer = (currentBuffer + 1) % NUM_STREAM_BUFFERS;
-                    attempts++;
-                    if (attempts >= NUM_STREAM_BUFFERS) {
-                        StreamBuffer& oldest = streamBuffers[currentBuffer];
-                        if (oldest.d3dFence->GetCompletedValue() < oldest.fenceValue) {
-                            oldest.d3dFence->SetEventOnCompletion(oldest.fenceValue, oldest.fenceEvent);
-                            WaitForSingleObject(oldest.fenceEvent, INFINITE);
-                        }
-                        ThrowIfCudaFailed(cudaEventSynchronize(oldest.processingComplete),
-                            "Wait for processing");
-                        oldest.inUse = false;
-                        buf = &oldest;
-                    }
-                }
+            if (buf->inUse) {
+                cudaEventSynchronize(buf->processingComplete);
+                buf->inUse = false;
             }
 
-            // === Load Chunk ===
             uint64_t readSize = min(STREAM_CHUNK_SIZE + OVERLAP_SIZE, fileSize - currentFileOffset);
 
+            // Submit IO
             DSTORAGE_REQUEST request = {};
             request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
             request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
@@ -592,167 +385,51 @@ int main(int argc, char* argv[]) {
             request.Destination.Buffer.Size = (uint32_t)readSize;
 
             pDsQueue->EnqueueRequest(&request);
-
             buf->fenceValue = nextFenceValue++;
             pDsQueue->EnqueueSignal(buf->d3dFence.Get(), buf->fenceValue);
             pDsQueue->Submit();
             buf->inUse = true;
 
-            // === Wait for Load ===
-            if (buf->d3dFence->GetCompletedValue() < buf->fenceValue) {
-                buf->d3dFence->SetEventOnCompletion(buf->fenceValue, buf->fenceEvent);
-                WaitForSingleObject(buf->fenceEvent, INFINITE);
-            }
+            // Wait for IO
+            buf->d3dFence->SetEventOnCompletion(buf->fenceValue, buf->fenceEvent);
+            WaitForSingleObject(buf->fenceEvent, INFINITE);
 
-            // === Find Last Complete Line ===
-            size_t processableSize = readSize;
+            int num_blocks = min(65535, (int)((readSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
 
-            if (currentFileOffset + readSize < fileSize) {
-                find_last_newline << <1, 1, 0, buf->cudaStream >> > (
-                    (char*)buf->cudaPtr, readSize, buf->d_lastNewline
-                    );
-                ThrowIfCudaFailed(cudaMemcpyAsync(&processableSize, buf->d_lastNewline,
-                    sizeof(size_t), cudaMemcpyDeviceToHost, buf->cudaStream),
-                    "Get processable size");
-                ThrowIfCudaFailed(cudaStreamSynchronize(buf->cudaStream),
-                    "Sync for processable size");
-
-                // Debug output
-                if (processableSize == 0) {
-                    printf("WARNING: No complete lines found in chunk at offset %llu\n", currentFileOffset);
-                    processableSize = readSize; // Fallback
-                }
-            }
-
-            buf->actualDataSize = processableSize;
-
-            // === Build Line Offsets ===
-            ThrowIfCudaFailed(cudaMemsetAsync(buf->d_counter, 0, sizeof(size_t), buf->cudaStream),
-                "Reset counter");
-
-            size_t zero = 0;
-            ThrowIfCudaFailed(cudaMemcpyAsync(buf->d_lineOffsets, &zero, sizeof(size_t),
-                cudaMemcpyHostToDevice, buf->cudaStream), "Set first offset");
-
-            int scan_blocks = min(2048, (int)((processableSize + BLOCK_SIZE - 1) / BLOCK_SIZE));
-            build_offsets_kernel_atomic << <scan_blocks, BLOCK_SIZE, 0, buf->cudaStream >> > (
-                (char*)buf->cudaPtr, processableSize, buf->d_lineOffsets, buf->d_counter
+            parse_and_aggregate_kernel << <num_blocks, THREADS_PER_BLOCK, 0, buf->cudaStream >> > (
+                (char*)buf->cudaPtr,
+                STREAM_CHUNK_SIZE,
+                readSize,
+                currentFileOffset,
+                d_globalMap
                 );
 
-            // Get line count
-            size_t num_lines;
-            ThrowIfCudaFailed(cudaMemcpyAsync(&num_lines, buf->d_counter, sizeof(size_t),
-                cudaMemcpyDeviceToHost, buf->cudaStream), "Get line count");
-            ThrowIfCudaFailed(cudaStreamSynchronize(buf->cudaStream), "Wait for line count");
+            cudaEventRecord(buf->processingComplete, buf->cudaStream);
 
-            // Debug output
-            static uint64_t totalLines = 0;
-            totalLines += num_lines;
-            if (num_lines == 0) {
-                printf("WARNING: No lines found in chunk at offset %llu, size %zu\n",
-                    currentFileOffset, processableSize);
-            }
-
-            // Set last offset
-            ThrowIfCudaFailed(cudaMemcpyAsync(buf->d_lineOffsets + num_lines + 1,
-                &processableSize, sizeof(size_t), cudaMemcpyHostToDevice, buf->cudaStream),
-                "Set last offset");
-
-            // === Process Lines ===
-            if (num_lines > 0) {
-                ThrowIfCudaFailed(cudaMemsetAsync(buf->d_threadResults, 0,
-                    (size_t)num_threads * LOCAL_HASH_SIZE * sizeof(StationStats),
-                    buf->cudaStream), "Reset thread results");
-                ThrowIfCudaFailed(cudaMemsetAsync(buf->d_threadCounts, 0,
-                    num_threads * sizeof(int), buf->cudaStream), "Reset thread counts");
-
-                process_measurements_local << <num_blocks, BLOCK_SIZE, 0, buf->cudaStream >> > (
-                    (char*)buf->cudaPtr,
-                    buf->d_lineOffsets,
-                    num_lines,
-                    buf->d_threadResults,
-                    buf->d_threadCounts,
-                    d_globalHash,     // <--- Pass the global hash pointer
-                    buf->actualDataSize // <--- Pass the limit for scanning
-                    );
-
-                // === Merge Results ===
-                int merge_blocks = (num_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                merge_results << <merge_blocks, BLOCK_SIZE, 0, buf->cudaStream >> > (
-                    buf->d_threadResults, buf->d_threadCounts, num_threads, d_globalHash
-                    );
-            }
-
-            // Record completion
-            ThrowIfCudaFailed(cudaEventRecord(buf->processingComplete, buf->cudaStream),
-                "Record event");
-
-            // Advance file offset
-            currentFileOffset += processableSize;
-
-            // Move to next buffer
+            currentFileOffset += STREAM_CHUNK_SIZE;
             currentBuffer = (currentBuffer + 1) % NUM_STREAM_BUFFERS;
-
-            // Progress update
-            static int lastPercent = -1;
-            int percent = (int)(100.0 * currentFileOffset / fileSize);
-            if (percent != lastPercent && percent % 10 == 0) {
-                printf("     Progress: %d%%\n", percent);
-                lastPercent = percent;
-            }
         }
 
-        // === Wait for All Processing ===
-        printf("[Stream] Waiting for all processing to complete...\n");
-        for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
-            if (streamBuffers[i].inUse) {
-                ThrowIfCudaFailed(cudaEventSynchronize(streamBuffers[i].processingComplete),
-                    "Final sync");
-            }
-        }
+        for (int i = 0; i < NUM_STREAM_BUFFERS; i++) cudaEventSynchronize(streamBuffers[i].processingComplete);
 
-        QueryPerformanceCounter(&end_stream);
-        printf("     Total streaming completed in %.2f ms\n", get_elapsed_ms(start_stream, end_stream));
+        QueryPerformanceCounter(&end_total);
 
-        // === 7. Copy Results Back ===
-        printf("[Out] Reading back results...\n");
-
-        StationStats* h_globalHash = (StationStats*)malloc(HASH_SIZE * sizeof(StationStats));
-        ThrowIfCudaFailed(cudaMemcpy(h_globalHash, d_globalHash, HASH_SIZE * sizeof(StationStats),
-            cudaMemcpyDeviceToHost), "Copy results to host");
-
-        // Debug: Count non-empty entries
-        int nonEmptyCount = 0;
-        for (int i = 0; i < HASH_SIZE; i++) {
-            if (h_globalHash[i].count > 0) {
-                nonEmptyCount++;
-                // Print first few stations for debugging
-                if (nonEmptyCount <= 3) {
-                    printf("      Sample station: %s (count=%d, min=%d, max=%d)\n",
-                        h_globalHash[i].name, h_globalHash[i].count,
-                        h_globalHash[i].min, h_globalHash[i].max);
-                }
-            }
-        }
-        printf("      Found %d non-empty hash entries\n", nonEmptyCount);
-
-        // === 8. Sort and Write Output ===
-        printf("[Out] Writing output...\n");
+        // === Readback ===
+        GlobalMapEntry* h_map = (GlobalMapEntry*)malloc(GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry));
+        cudaMemcpy(h_map, d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry), cudaMemcpyDeviceToHost);
 
         std::map<std::string, StationStats> sortedStats;
-        for (int i = 0; i < HASH_SIZE; i++) {
-            if (h_globalHash[i].count > 0 && h_globalHash[i].name[0] != '\0') {
-                std::string key(h_globalHash[i].name);
-                auto it = sortedStats.find(key);
-                if (it != sortedStats.end()) {
-                    if (h_globalHash[i].min < it->second.min) it->second.min = h_globalHash[i].min;
-                    if (h_globalHash[i].max > it->second.max) it->second.max = h_globalHash[i].max;
-                    it->second.sum += h_globalHash[i].sum;
-                    it->second.count += h_globalHash[i].count;
-                }
-                else {
-                    sortedStats[key] = h_globalHash[i];
-                }
+        for (int i = 0; i < GLOBAL_HASH_SIZE; i++) {
+            if (h_map[i].hash != 0) {
+                if (h_map[i].name[0] == 0) continue;
+
+                std::string name(h_map[i].name);
+                StationStats s;
+                s.min = h_map[i].stats.min;
+                s.max = h_map[i].stats.max;
+                s.sum = h_map[i].stats.sum;
+                s.count = h_map[i].stats.count;
+                sortedStats[name] = s;
             }
         }
 
@@ -761,54 +438,25 @@ int main(int argc, char* argv[]) {
         bool first = true;
         for (const auto& kv : sortedStats) {
             if (!first) outfile << ", ";
-            const auto& s = kv.second;
-            double minVal = s.min / 10.0;
-            double avgVal = (s.sum / 10.0) / s.count;
-            double maxVal = s.max / 10.0;
-            outfile << kv.first << "="
-                << std::fixed << std::setprecision(1)
-                << minVal << "/" << avgVal << "/" << maxVal;
+            double minVal = kv.second.min / 10.0;
+            double avgVal = (kv.second.sum / 10.0) / kv.second.count;
+            double maxVal = kv.second.max / 10.0;
+            outfile << kv.first << "=" << std::fixed << std::setprecision(1) << minVal << "/" << avgVal << "/" << maxVal;
             first = false;
         }
         outfile << "}\n";
         outfile.close();
 
-        printf("      Wrote %zu stations to %s\n", sortedStats.size(), outputFileName);
+        free(h_map);
+        cudaFree(d_globalMap);
 
-        // === Cleanup ===
-        free(h_globalHash);
-
-        for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
-            auto& buf = streamBuffers[i];
-            cudaFree(buf.d_lineOffsets);
-            cudaFree(buf.d_counter);
-            cudaFree(buf.d_lastNewline);
-            cudaFree(buf.d_threadResults);
-            cudaFree(buf.d_threadCounts);
-            cudaEventDestroy(buf.processingComplete);
-            cudaStreamDestroy(buf.cudaStream);
-            cudaDestroyExternalMemory(buf.cudaExtMem);
-            CloseHandle(buf.fenceEvent);
-        }
-
-        cudaFree(d_globalHash);
-
-        QueryPerformanceCounter(&end_total);
-
-        // Print timing summary
-        printf("\n========== TIMING SUMMARY ==========\n");
-        printf("Streaming & Processing:  %8.2f ms\n", get_elapsed_ms(start_stream, end_stream));
-        printf("------------------------------------\n");
-        printf("Total Runtime:           %8.2f ms (%.3f sec)\n",
-            get_elapsed_ms(start_total, end_total),
-            get_elapsed_ms(start_total, end_total) / 1000.0);
-        printf("====================================\n");
+        double time_ms = (double)(end_total.QuadPart - start_total.QuadPart) * 1000.0 / freq.QuadPart;
+        printf("Total Time: %.2fms\n", time_ms);
 
     }
     catch (const std::exception& e) {
-        std::cerr << "EXCEPTION: " << e.what() << std::endl;
+        std::cerr << e.what() << std::endl;
         return 1;
     }
-
     return 0;
 }
