@@ -38,7 +38,7 @@ using Microsoft::WRL::ComPtr;
 
 // IO Configuration
 const int NUM_STREAM_BUFFERS = 3;
-const uint64_t STREAM_CHUNK_SIZE = 31 * 1024 * 1024; // 256MB chunks
+const uint64_t STREAM_CHUNK_SIZE = 32000000; // 32 MB chunks
 const size_t OVERLAP_SIZE = 65536; // 64KB overlap
 const int THREADS_PER_BLOCK = 256;
 
@@ -129,8 +129,8 @@ __global__ void parse_and_aggregate_kernel(
     size_t tid = threadIdx.x;
     for (int i = tid; i < SHM_HASH_SIZE; i += blockDim.x) {
         shm_entries[i].hash = 0;
-        shm_entries[i].stats.min = 2147483647;
-        shm_entries[i].stats.max = -2147483648;
+        shm_entries[i].stats.min = INT_MAX;
+        shm_entries[i].stats.max = INT_MIN;
         shm_entries[i].stats.sum = 0;
         shm_entries[i].stats.count = 0;
     }
@@ -138,24 +138,21 @@ __global__ void parse_and_aggregate_kernel(
 
     size_t idx = (size_t)blockIdx.x * blockDim.x + tid;
     size_t stride = (size_t)blockDim.x * gridDim.x;
-    const size_t WINDOW_SIZE = 128; // Keep this 128
+    const size_t WINDOW_SIZE = 128;
 
     for (size_t offset = idx * WINDOW_SIZE; offset < buffer_limit; offset += stride * WINDOW_SIZE) {
         const char* ptr = data + offset;
-        // EXTEND the search window to the buffer limit, not the thread window
         const char* end_window = data + min(offset + WINDOW_SIZE, buffer_limit); 
         const char* buffer_end = data + buffer_limit; // Absolute end of valid data
 
         if (offset == 0) {
-            // First chunk: Start immediately. 
-            // Later chunks: Blind skip (standard logic)
             if (chunk_offset_global > 0) {
                  while (ptr < buffer_end && *ptr != '\n') ptr++;
                  ptr++;
             }
         }
         else {
-            // FIXED LOGIC: Only skip if we are NOT at the start of a line
+            // Skip if we are NOT at the start of a line
             if (offset > 0 && *(ptr - 1) != '\n') {
                 while (ptr < buffer_end && *ptr != '\n') ptr++;
                 ptr++;
@@ -163,9 +160,8 @@ __global__ void parse_and_aggregate_kernel(
         }
 
         // Main Processing Loop
-        while (ptr < end_window) { // Keep processing as long as we start inside our window
+        while (ptr < end_window) {
             
-            // Chunk Boundary Check (Your previous fix)
             if ((size_t)(ptr - data) > chunk_size) break;
             if (ptr >= buffer_end) break;
 
@@ -245,8 +241,8 @@ __global__ void init_global_map_kernel(GlobalMapEntry* entries, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         entries[idx].hash = 0; // 0 indicates empty
-        entries[idx].stats.min = 2147483647;
-        entries[idx].stats.max = -2147483648;
+        entries[idx].stats.min = INT_MAX;
+        entries[idx].stats.max = INT_MIN;
         entries[idx].stats.sum = 0;
         entries[idx].stats.count = 0;
         // Name doesn't need clearing if we check hash, 
@@ -282,7 +278,7 @@ int main(int argc, char* argv[]) {
     StreamBuffer streamBuffers[NUM_STREAM_BUFFERS];
 
     try {
-        // Init
+        // Init D3D12
         CreateDXGIFactory2(0, IID_PPV_ARGS(&pDxgiFactory));
         ComPtr<IDXGIAdapter1> pAdapter;
         pDxgiFactory->EnumAdapters1(0, &pAdapter);
@@ -303,13 +299,12 @@ int main(int argc, char* argv[]) {
             }
         }
         if (cudaDeviceID == -1) {
-            // Fallback for simple systems
             cudaDeviceID = 0;
             printf("Warning: Could not match LUID, defaulting to Device 0\n");
         }
         cudaSetDevice(cudaDeviceID);
 
-        // DirectStorage
+        // Create a DirectStorage factory and open the file
         DStorageGetFactory(IID_PPV_ARGS(&pDsFactory));
         std::wstring wFileName(inputFileName, inputFileName + strlen(inputFileName));
         ThrowIfFailed(pDsFactory->OpenFile(wFileName.c_str(), IID_PPV_ARGS(&pDsFile)), "OpenFile");
@@ -323,14 +318,14 @@ int main(int argc, char* argv[]) {
         dsQueueDesc.Priority = DSTORAGE_PRIORITY_HIGH;
         dsQueueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         dsQueueDesc.Device = pDevice.Get();
+    
         pDsFactory->CreateQueue(&dsQueueDesc, IID_PPV_ARGS(&pDsQueue));
-        pDsFactory->SetStagingBufferSize(512 * 1024 * 1024);
 
-        // === Buffer Init (FIXED) ===
+        // Create stream buffers
         for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
             auto& buf = streamBuffers[i];
 
-            // 1. Define Resource Description
+            // Define D3D12 resource
             D3D12_RESOURCE_DESC resDesc = {};
             resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             resDesc.Width = STREAM_CHUNK_SIZE + OVERLAP_SIZE;
@@ -339,11 +334,11 @@ int main(int argc, char* argv[]) {
             resDesc.MipLevels = 1;
             resDesc.SampleDesc.Count = 1;
             resDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            resDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            resDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
-            // 2. Get REAL allocation size (Fix for Invalid Argument)
+            // Store real allocation size for CUDA
             D3D12_RESOURCE_ALLOCATION_INFO allocInfo = pDevice->GetResourceAllocationInfo(0, 1, &resDesc);
-            buf.allocationSize = allocInfo.SizeInBytes; // This is the size CUDA wants
+            buf.allocationSize = allocInfo.SizeInBytes;
 
             D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1 };
 
@@ -353,14 +348,14 @@ int main(int argc, char* argv[]) {
             buf.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
             buf.fenceValue = 0;
 
-            // 3. Create Shared Handle with Error Check
+            // Create Shared Handle
             HANDLE sharedHandle = nullptr;
             ThrowIfFailed(pDevice->CreateSharedHandle(buf.d3d12Buffer.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle), "CreateSharedHandle");
 
-            // 4. Import using the PHYSICAL allocation size
+            // Import D3D12-allocated memory into CUDA using the physical allocation size
             cudaExternalMemoryHandleDesc extDesc = {};
             extDesc.type = cudaExternalMemoryHandleTypeD3D12Resource;
-            extDesc.size = buf.allocationSize; // Using the queried size
+            extDesc.size = buf.allocationSize;
             extDesc.handle.win32.handle = sharedHandle;
             extDesc.flags = cudaExternalMemoryDedicated;
 
@@ -379,16 +374,15 @@ int main(int argc, char* argv[]) {
 
         // Global Map Alloc
         ThrowIfCudaFailed(cudaMalloc(&d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Malloc map");
-        // ThrowIfCudaFailed(cudaMemset(d_globalMap, 0, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Memset map");
 
-        // WITH THIS:
+        // Launch global map:
         int initBlockSize = 256;
         int initGridSize = (GLOBAL_HASH_SIZE + initBlockSize - 1) / initBlockSize;
         init_global_map_kernel<<<initGridSize, initBlockSize>>>(d_globalMap, GLOBAL_HASH_SIZE);
         ThrowIfCudaFailed(cudaGetLastError(), "Init kernel launch");
         ThrowIfCudaFailed(cudaDeviceSynchronize(), "Init kernel sync");
 
-        // === PIPELINED EXECUTION ===
+        // PIPELINED EXECUTION
         uint64_t currentFileOffset = 0;
         int currentBuffer = 0;
         UINT64 nextFenceValue = 1;
@@ -425,7 +419,7 @@ int main(int argc, char* argv[]) {
             buf->d3dFence->SetEventOnCompletion(buf->fenceValue, buf->fenceEvent);
             WaitForSingleObject(buf->fenceEvent, INFINITE);
 
-            int num_blocks = min(65535, (int)((readSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
+            int num_blocks = min(GLOBAL_HASH_SIZE, (int)((readSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
 
             parse_and_aggregate_kernel << <num_blocks, THREADS_PER_BLOCK, 0, buf->cudaStream >> > (
                 (char*)buf->cudaPtr,
@@ -445,7 +439,7 @@ int main(int argc, char* argv[]) {
 
         QueryPerformanceCounter(&end_total);
 
-        // === Readback ===
+        // Readback
         GlobalMapEntry* h_map = (GlobalMapEntry*)malloc(GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry));
         cudaMemcpy(h_map, d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry), cudaMemcpyDeviceToHost);
 
