@@ -39,7 +39,6 @@
 
 # debug information files
 *.dwo
-data/
 .ipynb_checkpoints/
 cufile.log
 
@@ -471,3 +470,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+test/*.out
+test/data/*
+!test/data/.gitkeep
