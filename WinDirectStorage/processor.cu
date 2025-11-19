@@ -138,26 +138,36 @@ __global__ void parse_and_aggregate_kernel(
 
     size_t idx = (size_t)blockIdx.x * blockDim.x + tid;
     size_t stride = (size_t)blockDim.x * gridDim.x;
-    const size_t WINDOW_SIZE = 128;
+    const size_t WINDOW_SIZE = 128; // Keep this 128
 
     for (size_t offset = idx * WINDOW_SIZE; offset < buffer_limit; offset += stride * WINDOW_SIZE) {
         const char* ptr = data + offset;
-        const char* end_window = data + min(offset + WINDOW_SIZE, buffer_limit);
+        // EXTEND the search window to the buffer limit, not the thread window
+        const char* end_window = data + min(offset + WINDOW_SIZE, buffer_limit); 
+        const char* buffer_end = data + buffer_limit; // Absolute end of valid data
 
         if (offset == 0) {
+            // First chunk: Start immediately. 
+            // Later chunks: Blind skip (standard logic)
             if (chunk_offset_global > 0) {
-                while (ptr < end_window && *ptr != '\n') ptr++;
-                ptr++;
+                 while (ptr < buffer_end && *ptr != '\n') ptr++;
+                 ptr++;
             }
         }
         else {
-            while (ptr < end_window && *ptr != '\n') ptr++;
-            ptr++;
+            // FIXED LOGIC: Only skip if we are NOT at the start of a line
+            if (offset > 0 && *(ptr - 1) != '\n') {
+                while (ptr < buffer_end && *ptr != '\n') ptr++;
+                ptr++;
+            }
         }
 
-        while (ptr < end_window) {
-            if ((size_t)(ptr - data) >= chunk_size) break;
-            if (ptr >= data + buffer_limit) break;
+        // Main Processing Loop
+        while (ptr < end_window) { // Keep processing as long as we start inside our window
+            
+            // Chunk Boundary Check (Your previous fix)
+            if ((size_t)(ptr - data) > chunk_size) break;
+            if (ptr >= buffer_end) break;
 
             const char* line_start = ptr;
             unsigned long long hash = FNV_OFFSET_BASIS_64;
@@ -228,6 +238,20 @@ __global__ void parse_and_aggregate_kernel(
                 slot = (slot + 1) % GLOBAL_HASH_SIZE;
             }
         }
+    }
+}
+
+__global__ void init_global_map_kernel(GlobalMapEntry* entries, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        entries[idx].hash = 0; // 0 indicates empty
+        entries[idx].stats.min = 2147483647;
+        entries[idx].stats.max = -2147483648;
+        entries[idx].stats.sum = 0;
+        entries[idx].stats.count = 0;
+        // Name doesn't need clearing if we check hash, 
+        // but safety first:
+        entries[idx].name[0] = '\0'; 
     }
 }
 
@@ -355,7 +379,14 @@ int main(int argc, char* argv[]) {
 
         // Global Map Alloc
         ThrowIfCudaFailed(cudaMalloc(&d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Malloc map");
-        ThrowIfCudaFailed(cudaMemset(d_globalMap, 0, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Memset map");
+        // ThrowIfCudaFailed(cudaMemset(d_globalMap, 0, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Memset map");
+
+        // WITH THIS:
+        int initBlockSize = 256;
+        int initGridSize = (GLOBAL_HASH_SIZE + initBlockSize - 1) / initBlockSize;
+        init_global_map_kernel<<<initGridSize, initBlockSize>>>(d_globalMap, GLOBAL_HASH_SIZE);
+        ThrowIfCudaFailed(cudaGetLastError(), "Init kernel launch");
+        ThrowIfCudaFailed(cudaDeviceSynchronize(), "Init kernel sync");
 
         // === PIPELINED EXECUTION ===
         uint64_t currentFileOffset = 0;
