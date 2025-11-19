@@ -86,7 +86,8 @@ If these tools are not found, you may need to enter a Developer Command Prompt o
 
 ### Building the Code
 1. Download DirectStorage SDK from [here](https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/1.3.0) and replace `.nupkg` extension with `.zip`
-2. Extract contents to a folder `directstorage` in the current folder
-3. Run `cmake -B build -S .` to configure CMake
-4. Run `cmake --build build --config Release`
-5. In `build\Release\`, there will be the executable and associated DLLs needed to run the application
+2. Extract contents to a folder `directstorage` in the `src/` folder
+4. Run `cmake -B build -S .` to configure CMake
+5. Run `cmake --build build --config Release`
+
+6. In `build\Release\`, there will be the executable and associated DLLs needed to run the application
