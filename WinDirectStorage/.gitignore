@@ -1,1 +1,4 @@
-test_data.bin
+*.exe
+*.obj
+directstorage/
+build/
