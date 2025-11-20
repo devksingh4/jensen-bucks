@@ -21,10 +21,10 @@ DirectStorage is a storage API from Microsoft that enables developers to directl
 GPU-accelerated processing would seem like a natural first step for tackling the 1BRC; after all, GPUs excel at parallel workloads. However, traditional GPU approaches hit a fundamental bottleneck: moving data to the GPU is *really* slow. 
 
 The conventional pipeline looks like this:
-1. CPU reads file from disk (~3-7 GB/s on NVMe)
-2. CPU copies data to GPU over PCIe (~12-16 GB/s on PCIe 3.0, ~25-32 GB/s on PCIe 4.0)
+1. CPU reads file from disk
+2. CPU copies data to GPU over PCIe
 
-For a 14 GB file, this PCIe transfer alone takes 1-2 seconds—before any processing begins. Many GPU implementations struggle because:
+For a 14 GB file, this PCIe transfer alone takes several seconds before any processing begins. Many GPU implementations struggle because:
 - The entire 14 GB file may not fit in VRAM (especially on consumer GPUs)
 - CPU-to-GPU transfers become the bottleneck, not computation
 - The GPU sits idle while waiting for data
@@ -33,7 +33,7 @@ DirectStorage eliminates this bottleneck: by loading data directly from NVMe int
 
 ## Performance Comparison
 
-While our implementation doesn't beat the fastest CPU solutions (which achieve sub-2 second times on high-end server hardware), DirectStorage-based GPU processing offers compelling advantages:
+While our implementation doesn't beat the fastest CPU solutions when reading from disk (which achieve ~1.5 second times on high-end server hardware), DirectStorage-based GPU processing offers compelling advantages:
 
 ### Competitive on Consumer Hardware
 - Our runtime on a mobile RTX 3070 Ti is competitive with many CPU implementations
@@ -98,6 +98,7 @@ The data can be found at https://drive.google.com/drive/folders/1jpDVb7LjZgByvVY
 
 ## Testing
 Please see [the test folder](test/) for instructions.
+
 
 
 
