@@ -34,7 +34,7 @@ DirectStorage eliminates this bottleneck: by loading data directly from NVMe int
 While our implementation doesn't beat the fastest CPU solutions (which achieve sub-2 second times on high-end server hardware), DirectStorage-based GPU processing offers compelling advantages:
 
 ### Competitive on Consumer Hardware
-- Our 5.8s time on a mobile RTX 3070 Ti is competitive with many CPU implementations
+- Our runtime on a mobile RTX 3070 Ti is competitive with many CPU implementations
 - Consumer laptops can now handle billion-row datasets without specialized hardware
 - Democratizes large-scale data processing
 
@@ -93,4 +93,5 @@ If these tools are not found, you may need to enter a Developer Command Prompt o
 
 ## Testing
 Please see [the test folder](test/) for instructions.
+
 
