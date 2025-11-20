@@ -1,8 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
 
-call :run_and_verify ./data/measurements_50mil.txt ./50mil.out b88372780b09030bf46cf490223b300248878a27497b1c92d257fb29ff15bc75
-call :run_and_verify ./data/measurements_300mil.txt ./300mil.out f5a3358fb3f59c5dd2b7403f8b1de4a82ec2e3e165d98800b1d2225768d4f1ef
+call :run_and_verify ./data/measurements_100mil.txt ./100mil.out 1822092ffe421c70bf9fb5faded5dcbeb5724f02b22ca8ff9bb9051fa2ec6c2d
+call :run_and_verify ./data/measurements_500mil.txt ./500mil.out 1796d3ebcd8a46137557f3f306966dda49aad17e9f8e1101f2c47d1f1afbcdf5
 call :run_and_verify ./data/measurements_full.txt ./full.out 31ebb58f6ec1a90169a06ef8b4e03cedd9698e6acc4c055bb280cf6526a556a5
 
 exit /b %ERRORLEVEL%
