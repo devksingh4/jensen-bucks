@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <vector>
 #include <algorithm>
+#include <queue>
 
 // Windows & D3D12
 #include <d3d12.h>
@@ -36,10 +37,10 @@ using Microsoft::WRL::ComPtr;
 #define FNV_PRIME_64 1099511628211ULL
 #define FNV_OFFSET_BASIS_64 14695981039346656037ULL
 
-// IO Configuration
-const int NUM_STREAM_BUFFERS = 3;
-const uint64_t STREAM_CHUNK_SIZE = 32000000; // 32 MB chunks
-const size_t OVERLAP_SIZE = 65536; // 64KB overlap
+const int NUM_IO_QUEUES = 16;
+const int NUM_STREAM_BUFFERS = 32;
+const size_t OVERLAP_SIZE = 65536;
+const uint64_t STREAM_CHUNK_SIZE = 32*1024*1024 - OVERLAP_SIZE;
 const int THREADS_PER_BLOCK = 256;
 
 // CPU-Side Helper
@@ -84,7 +85,10 @@ struct StreamBuffer {
     cudaEvent_t processingComplete;
 
     bool inUse;
-    uint64_t allocationSize; // Store the real allocation size
+    uint64_t allocationSize;
+    uint64_t fileOffset;
+    uint64_t dataSize;
+    int queueIndex; // Which queue submitted this request
 };
 
 // =================================================================================
@@ -152,16 +156,13 @@ __global__ void parse_and_aggregate_kernel(
             }
         }
         else {
-            // Skip if we are NOT at the start of a line
             if (offset > 0 && *(ptr - 1) != '\n') {
                 while (ptr < buffer_end && *ptr != '\n') ptr++;
                 ptr++;
             }
         }
 
-        // Main Processing Loop
         while (ptr < end_window) {
-            
             if ((size_t)(ptr - data) > chunk_size) break;
             if (ptr >= buffer_end) break;
 
@@ -245,8 +246,6 @@ __global__ void init_global_map_kernel(GlobalMapEntry* entries, int size) {
         entries[idx].stats.max = INT_MIN;
         entries[idx].stats.sum = 0;
         entries[idx].stats.count = 0;
-        // Name doesn't need clearing if we check hash, 
-        // but safety first:
         entries[idx].name[0] = '\0'; 
     }
 }
@@ -272,7 +271,7 @@ int main(int argc, char* argv[]) {
     ComPtr<IDXGIFactory4> pDxgiFactory;
     ComPtr<IDStorageFactory> pDsFactory;
     ComPtr<IDStorageFile> pDsFile;
-    ComPtr<IDStorageQueue> pDsQueue;
+    ComPtr<IDStorageQueue> pDsQueues[NUM_IO_QUEUES];
 
     GlobalMapEntry* d_globalMap = nullptr;
     StreamBuffer streamBuffers[NUM_STREAM_BUFFERS];
@@ -304,7 +303,6 @@ int main(int argc, char* argv[]) {
         }
         cudaSetDevice(cudaDeviceID);
 
-        // Create a DirectStorage factory and open the file
         DStorageGetFactory(IID_PPV_ARGS(&pDsFactory));
         std::wstring wFileName(inputFileName, inputFileName + strlen(inputFileName));
         ThrowIfFailed(pDsFactory->OpenFile(wFileName.c_str(), IID_PPV_ARGS(&pDsFile)), "OpenFile");
@@ -313,19 +311,19 @@ int main(int argc, char* argv[]) {
         pDsFile->GetFileInformation(&fileInfo);
         uint64_t fileSize = (static_cast<uint64_t>(fileInfo.nFileSizeHigh) << 32) | fileInfo.nFileSizeLow;
 
-        DSTORAGE_QUEUE_DESC dsQueueDesc = {};
-        dsQueueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
-        dsQueueDesc.Priority = DSTORAGE_PRIORITY_HIGH;
-        dsQueueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-        dsQueueDesc.Device = pDevice.Get();
-    
-        pDsFactory->CreateQueue(&dsQueueDesc, IID_PPV_ARGS(&pDsQueue));
+        for (int i = 0; i < NUM_IO_QUEUES; i++) {
+            DSTORAGE_QUEUE_DESC dsQueueDesc = {};
+            dsQueueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
+            dsQueueDesc.Priority = DSTORAGE_PRIORITY_HIGH;
+            dsQueueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+            dsQueueDesc.Device = pDevice.Get();
+            
+            ThrowIfFailed(pDsFactory->CreateQueue(&dsQueueDesc, IID_PPV_ARGS(&pDsQueues[i])), "Create queue");
+        }
 
-        // Create stream buffers
         for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
             auto& buf = streamBuffers[i];
 
-            // Define D3D12 resource
             D3D12_RESOURCE_DESC resDesc = {};
             resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             resDesc.Width = STREAM_CHUNK_SIZE + OVERLAP_SIZE;
@@ -336,7 +334,6 @@ int main(int argc, char* argv[]) {
             resDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             resDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
-            // Store real allocation size for CUDA
             D3D12_RESOURCE_ALLOCATION_INFO allocInfo = pDevice->GetResourceAllocationInfo(0, 1, &resDesc);
             buf.allocationSize = allocInfo.SizeInBytes;
 
@@ -348,11 +345,9 @@ int main(int argc, char* argv[]) {
             buf.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
             buf.fenceValue = 0;
 
-            // Create Shared Handle
             HANDLE sharedHandle = nullptr;
             ThrowIfFailed(pDevice->CreateSharedHandle(buf.d3d12Buffer.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle), "CreateSharedHandle");
 
-            // Import D3D12-allocated memory into CUDA using the physical allocation size
             cudaExternalMemoryHandleDesc extDesc = {};
             extDesc.type = cudaExternalMemoryHandleTypeD3D12Resource;
             extDesc.size = buf.allocationSize;
@@ -375,67 +370,178 @@ int main(int argc, char* argv[]) {
         // Global Map Alloc
         ThrowIfCudaFailed(cudaMalloc(&d_globalMap, GLOBAL_HASH_SIZE * sizeof(GlobalMapEntry)), "Malloc map");
 
-        // Launch global map:
         int initBlockSize = 256;
         int initGridSize = (GLOBAL_HASH_SIZE + initBlockSize - 1) / initBlockSize;
         init_global_map_kernel<<<initGridSize, initBlockSize>>>(d_globalMap, GLOBAL_HASH_SIZE);
         ThrowIfCudaFailed(cudaGetLastError(), "Init kernel launch");
         ThrowIfCudaFailed(cudaDeviceSynchronize(), "Init kernel sync");
-
-        // PIPELINED EXECUTION
+        
+        std::queue<uint64_t> pendingOffsets;
         uint64_t currentFileOffset = 0;
-        int currentBuffer = 0;
-        UINT64 nextFenceValue = 1;
-
+        
+        // Calculate all chunk offsets
         while (currentFileOffset < fileSize) {
-            StreamBuffer* buf = &streamBuffers[currentBuffer];
+            pendingOffsets.push(currentFileOffset);
+            currentFileOffset += STREAM_CHUNK_SIZE;
+        }
+        
+        UINT64 nextFenceValue = 1;
+        int numActiveBuffers = 0;
+        int nextQueueIdx = 0;
 
-            if (buf->inUse) {
-                cudaEventSynchronize(buf->processingComplete);
-                buf->inUse = false;
-            }
-
-            uint64_t readSize = min(STREAM_CHUNK_SIZE + OVERLAP_SIZE, fileSize - currentFileOffset);
-
-            // Submit IO
+        for (int i = 0; i < NUM_STREAM_BUFFERS && !pendingOffsets.empty(); i++) {
+            StreamBuffer* buf = &streamBuffers[i];
+            uint64_t offset = pendingOffsets.front();
+            pendingOffsets.pop();
+            
+            uint64_t readSize = min(STREAM_CHUNK_SIZE + OVERLAP_SIZE, fileSize - offset);
+                        
             DSTORAGE_REQUEST request = {};
             request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
             request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
             request.Source.File.Source = pDsFile.Get();
-            request.Source.File.Offset = currentFileOffset;
+            request.Source.File.Offset = offset;
             request.Source.File.Size = (uint32_t)readSize;
             request.UncompressedSize = (uint32_t)readSize;
             request.Destination.Buffer.Resource = buf->d3d12Buffer.Get();
             request.Destination.Buffer.Offset = 0;
             request.Destination.Buffer.Size = (uint32_t)readSize;
 
-            pDsQueue->EnqueueRequest(&request);
+            // Round-robin across queues
+            int queueIdx = nextQueueIdx;
+            nextQueueIdx = (nextQueueIdx + 1) % NUM_IO_QUEUES;
+            
+            pDsQueues[queueIdx]->EnqueueRequest(&request);
             buf->fenceValue = nextFenceValue++;
-            pDsQueue->EnqueueSignal(buf->d3dFence.Get(), buf->fenceValue);
-            pDsQueue->Submit();
-            buf->inUse = true;
-
-            // Wait for IO
+            pDsQueues[queueIdx]->EnqueueSignal(buf->d3dFence.Get(), buf->fenceValue);
+            
             buf->d3dFence->SetEventOnCompletion(buf->fenceValue, buf->fenceEvent);
-            WaitForSingleObject(buf->fenceEvent, INFINITE);
-
-            int num_blocks = min(GLOBAL_HASH_SIZE, (int)((readSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
-
-            parse_and_aggregate_kernel << <num_blocks, THREADS_PER_BLOCK, 0, buf->cudaStream >> > (
-                (char*)buf->cudaPtr,
-                STREAM_CHUNK_SIZE,
-                readSize,
-                currentFileOffset,
-                d_globalMap
-                );
-
-            cudaEventRecord(buf->processingComplete, buf->cudaStream);
-
-            currentFileOffset += STREAM_CHUNK_SIZE;
-            currentBuffer = (currentBuffer + 1) % NUM_STREAM_BUFFERS;
+            
+            buf->inUse = true;
+            buf->fileOffset = offset;
+            buf->dataSize = readSize;
+            buf->queueIndex = queueIdx;
+            numActiveBuffers++;
+        }
+        
+        for (int i = 0; i < NUM_IO_QUEUES; i++) {
+            pDsQueues[i]->Submit();
+        }
+        
+        // Check for errors immediately after submit
+        for (int i = 0; i < NUM_IO_QUEUES; i++) {
+            DSTORAGE_ERROR_RECORD errorRecord = {};
+            pDsQueues[i]->RetrieveErrorRecord(&errorRecord);
+            if (FAILED(errorRecord.FirstFailure.HResult)) {
+                printf("Queue %d error: HRESULT=0x%08X\n", i, errorRecord.FirstFailure.HResult);
+            }
         }
 
-        for (int i = 0; i < NUM_STREAM_BUFFERS; i++) cudaEventSynchronize(streamBuffers[i].processingComplete);
+        // Process buffers as they complete and keep queues full
+        int processedChunks = 0;
+        int loopCount = 0;
+        
+        while (numActiveBuffers > 0) {
+            loopCount++;
+            
+            // Periodically check for DirectStorage errors
+            if (loopCount % 100 == 1) {
+                for (int i = 0; i < NUM_IO_QUEUES; i++) {
+                    DSTORAGE_ERROR_RECORD errorRecord = {};
+                    pDsQueues[i]->RetrieveErrorRecord(&errorRecord);
+                    if (FAILED(errorRecord.FirstFailure.HResult)) {
+                        throw std::runtime_error("DirectStorage error detected");
+                    }
+                }
+            }
+            
+            // Check ALL buffers by polling fence values
+            int numSubmittedThisRound = 0;
+            bool foundAnyReady = false;
+            
+            for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
+                StreamBuffer* buf = &streamBuffers[i];
+                
+                if (!buf->inUse) continue;
+                
+                // Check fence value directly - this is the source of truth
+                UINT64 completedValue = buf->d3dFence->GetCompletedValue();
+                if (completedValue < buf->fenceValue) {
+                    continue; // Not ready yet
+                }
+                
+                // Buffer is ready - launch CUDA kernel
+                foundAnyReady = true;
+                
+                int num_blocks = min(GLOBAL_HASH_SIZE, (int)((buf->dataSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
+
+                parse_and_aggregate_kernel<<<num_blocks, THREADS_PER_BLOCK, 0, buf->cudaStream>>>(
+                    (char*)buf->cudaPtr,
+                    STREAM_CHUNK_SIZE,
+                    buf->dataSize,
+                    buf->fileOffset,
+                    d_globalMap
+                );
+
+                cudaEventRecord(buf->processingComplete, buf->cudaStream);
+                processedChunks++;
+                
+                // Reuse buffer if more work available
+                if (!pendingOffsets.empty()) {
+                    // Wait for CUDA to finish before reusing
+                    cudaEventSynchronize(buf->processingComplete);
+                    
+                    uint64_t offset = pendingOffsets.front();
+                    pendingOffsets.pop();
+                    
+                    uint64_t readSize = min(STREAM_CHUNK_SIZE + OVERLAP_SIZE, fileSize - offset);
+                    
+                    DSTORAGE_REQUEST request = {};
+                    request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+                    request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+                    request.Source.File.Source = pDsFile.Get();
+                    request.Source.File.Offset = offset;
+                    request.Source.File.Size = (uint32_t)readSize;
+                    request.UncompressedSize = (uint32_t)readSize;
+                    request.Destination.Buffer.Resource = buf->d3d12Buffer.Get();
+                    request.Destination.Buffer.Offset = 0;
+                    request.Destination.Buffer.Size = (uint32_t)readSize;
+
+                    int queueIdx = nextQueueIdx;
+                    nextQueueIdx = (nextQueueIdx + 1) % NUM_IO_QUEUES;
+                    
+                    pDsQueues[queueIdx]->EnqueueRequest(&request);
+                    buf->fenceValue = nextFenceValue++;
+                    pDsQueues[queueIdx]->EnqueueSignal(buf->d3dFence.Get(), buf->fenceValue);
+                    
+                    buf->fileOffset = offset;
+                    buf->dataSize = readSize;
+                    buf->queueIndex = queueIdx;
+                    numSubmittedThisRound++;
+                } else {
+                    // No more work
+                    buf->inUse = false;
+                    numActiveBuffers--;
+                }
+            }
+            
+            if (numSubmittedThisRound > 0) {
+                for (int i = 0; i < NUM_IO_QUEUES; i++) {
+                    pDsQueues[i]->Submit();
+                }
+            }
+
+        }
+        
+        // Final submit for any pending requests
+        for (int i = 0; i < NUM_IO_QUEUES; i++) {
+            pDsQueues[i]->Submit();
+        }
+        
+        // Wait for all CUDA processing
+        for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
+            cudaEventSynchronize(streamBuffers[i].processingComplete);
+        }
 
         QueryPerformanceCounter(&end_total);
 
@@ -477,6 +583,7 @@ int main(int argc, char* argv[]) {
 
         double time_ms = (double)(end_total.QuadPart - start_total.QuadPart) * 1000.0 / freq.QuadPart;
         printf("Total Time: %.2fms\n", time_ms);
+        printf("Effective I/O throughput: %.2f GB/s\n", (fileSize / (1024.0*1024.0*1024.0)) / (time_ms / 1000.0));
 
     }
     catch (const std::exception& e) {
