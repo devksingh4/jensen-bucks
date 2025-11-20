@@ -84,6 +84,9 @@ cl.exe
 
 If these tools are not found, you may need to enter a Developer Command Prompt or Developer PowerShell, which was provided by Visual Studio.
 
+#### Download Data
+The data can be found at https://drive.google.com/drive/folders/1jpDVb7LjZgByvVYzkYKjPPWy6Tze_drS and is required for running the 1BRC.
+
 ### Building the Code
 1. Download DirectStorage SDK from [here](https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/1.3.0) and replace `.nupkg` extension with `.zip`
 2. Extract contents to a folder `directstorage` in the `src/` folder
@@ -93,5 +96,6 @@ If these tools are not found, you may need to enter a Developer Command Prompt o
 
 ## Testing
 Please see [the test folder](test/) for instructions.
+
 
 
