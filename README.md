@@ -4,7 +4,7 @@
 
 A high-performance implementation of the 1 Billion Row Challenge using the Microsoft DirectStorage API for accelerated data movement.
 
-We process the full 1 billion rows in **3.6 seconds** on an ASUS ROG Zephyrus G15 (2022) gaming laptop with an NVIDIA 3070Ti GPU and an AMD Ryzen 9 6900HS CPU, with a Samsung 990 Pro SSD.
+We process the full 1 billion rows in **2.4 seconds** on an ASUS ROG Zephyrus G15 (2022) gaming laptop with an NVIDIA 3070Ti GPU and an AMD Ryzen 9 6900HS CPU, with a Samsung 990 Pro SSD.
 
 ## What is the 1 Billion Row Challenge?
 

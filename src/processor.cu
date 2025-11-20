@@ -31,7 +31,7 @@ using Microsoft::WRL::ComPtr;
 
 #define MAX_NAME_LEN 100
 #define GLOBAL_HASH_SIZE 65536 
-#define SHM_HASH_SIZE 1024 
+#define SHM_HASH_SIZE 1024
 
 // FNV-1a 64-bit Constants
 #define FNV_PRIME_64 1099511628211ULL
@@ -41,6 +41,8 @@ const int NUM_IO_QUEUES = 16;
 const int NUM_STREAM_BUFFERS = 32;
 const size_t OVERLAP_SIZE = 65536;
 const uint64_t STREAM_CHUNK_SIZE = 32*1024*1024 - OVERLAP_SIZE;
+const uint64_t STAGING_BUFFER_SIZE = 256 * 1024 * 1024;
+
 const int THREADS_PER_BLOCK = 256;
 
 // CPU-Side Helper
@@ -52,7 +54,7 @@ struct StationStats {
 };
 
 // GPU-Side Stats (16 bytes aligned)
-struct __align__(16) CompactStats {
+struct CompactStats {
     long long sum;
     int min;
     int max;
@@ -303,6 +305,10 @@ int main(int argc, char* argv[]) {
         }
         cudaSetDevice(cudaDeviceID);
 
+        DSTORAGE_CONFIGURATION config = {};
+        config.DisableTelemetry = 1;
+        DStorageSetConfiguration(&config);
+
         DStorageGetFactory(IID_PPV_ARGS(&pDsFactory));
         std::wstring wFileName(inputFileName, inputFileName + strlen(inputFileName));
         ThrowIfFailed(pDsFactory->OpenFile(wFileName.c_str(), IID_PPV_ARGS(&pDsFile)), "OpenFile");
@@ -310,11 +316,12 @@ int main(int argc, char* argv[]) {
         BY_HANDLE_FILE_INFORMATION fileInfo = {};
         pDsFile->GetFileInformation(&fileInfo);
         uint64_t fileSize = (static_cast<uint64_t>(fileInfo.nFileSizeHigh) << 32) | fileInfo.nFileSizeLow;
-
+        
+        pDsFactory->SetStagingBufferSize(STAGING_BUFFER_SIZE);
         for (int i = 0; i < NUM_IO_QUEUES; i++) {
             DSTORAGE_QUEUE_DESC dsQueueDesc = {};
             dsQueueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
-            dsQueueDesc.Priority = DSTORAGE_PRIORITY_HIGH;
+            dsQueueDesc.Priority = DSTORAGE_PRIORITY_REALTIME;
             dsQueueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
             dsQueueDesc.Device = pDevice.Get();
             
@@ -457,7 +464,6 @@ int main(int argc, char* argv[]) {
             
             // Check ALL buffers by polling fence values
             int numSubmittedThisRound = 0;
-            bool foundAnyReady = false;
             
             for (int i = 0; i < NUM_STREAM_BUFFERS; i++) {
                 StreamBuffer* buf = &streamBuffers[i];
@@ -469,9 +475,7 @@ int main(int argc, char* argv[]) {
                 if (completedValue < buf->fenceValue) {
                     continue; // Not ready yet
                 }
-                
-                // Buffer is ready - launch CUDA kernel
-                foundAnyReady = true;
+
                 
                 int num_blocks = min(GLOBAL_HASH_SIZE, (int)((buf->dataSize + 128 * THREADS_PER_BLOCK - 1) / (128 * THREADS_PER_BLOCK)));
 
